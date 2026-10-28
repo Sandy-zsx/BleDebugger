@@ -19,6 +19,7 @@ import { useReconnect, type ReconnectStatus } from "../hooks/useReconnect";
 import {
   parseResponse,
   parsePumpResponse,
+  parseAlarmResponse,
   buildCommand,
   COMMANDS,
   type DeviceState,
@@ -62,6 +63,7 @@ export default function ControlPanel({
     mode: null,
     pump: null,
     adc: null,
+    alarm: null,
     raw: "",
   });
   const [reportActive, setReportActive] = useState(false);
@@ -141,6 +143,7 @@ export default function ControlPanel({
         // 解析
         const parsed = parseResponse(raw);
         const pumpResult = parsePumpResponse(raw);
+        const alarmResult = parseAlarmResponse(raw);
 
         addLog({
           timestamp: new Date(),
@@ -155,21 +158,45 @@ export default function ControlPanel({
           mode: parsed.mode ?? prev.mode,
           pump: parsed.pump ?? prev.pump,
           adc: parsed.adc ?? prev.adc,
+          alarm: parsed.alarm ?? prev.alarm,
           raw,
         }));
 
         // 泵操作反馈
         if (pumpResult.command) {
           if (pumpResult.success) {
-            const newPumpState = pumpResult.command === "PUMP_ON" ? "ON" : "OFF";
-            setState((prev) => ({ ...prev, pump: newPumpState }));
-            showToast(
-              pumpResult.command === "PUMP_ON" ? "水泵已开启" : "水泵已关闭",
-              "success"
-            );
+            setState((prev) => {
+              const newPumpState =
+                pumpResult.command === "PUMP_ON"
+                  ? "ON"
+                  : pumpResult.command === "PUMP_OFF"
+                    ? "OFF"
+                    : prev.pump === "ON"
+                      ? "OFF"
+                      : "ON"; // PUMP_TOGGLE
+              return { ...prev, pump: newPumpState };
+            });
+            const label =
+              pumpResult.command === "PUMP_ON"
+                ? "水泵已开启"
+                : pumpResult.command === "PUMP_OFF"
+                  ? "水泵已关闭"
+                  : "水泵已切换";
+            showToast(label, "success");
           } else if (pumpResult.reason) {
             showToast(`操作被拒绝：${pumpResult.reason}`, "warning");
           }
+        }
+
+        // 报警消息反馈
+        if (alarmResult.event === "active") {
+          setState((prev) => ({ ...prev, alarm: "ACTIVE" }));
+          showToast(alarmResult.message ?? "设备报警", "error");
+        } else if (alarmResult.event === "cleared") {
+          setState((prev) => ({ ...prev, alarm: "NONE" }));
+          showToast(alarmResult.message ?? "报警已清除", "success");
+        } else if (alarmResult.event === "none") {
+          showToast(alarmResult.message ?? "当前无报警", "info");
         }
 
         // 自动上报状态
@@ -337,21 +364,26 @@ export default function ControlPanel({
 
   // ---- 手动浇水 ----
   const handleWateringToggle = useCallback(() => {
+    if (state.alarm === "ACTIVE") {
+      showToast("设备处于报警状态，请先重置报警", "warning");
+      return;
+    }
     if (state.pump === "ON") {
       send(COMMANDS.PUMP_OFF, "PUMP_OFF");
     } else {
       send(COMMANDS.PUMP_ON, "PUMP_ON");
     }
-  }, [state.pump, send]);
+  }, [state.pump, state.alarm, send, showToast]);
+
+  // ---- 重置报警 ----
+  const handleResetAlarm = useCallback(() => {
+    send(COMMANDS.RESET_ALARM, "RESET_ALARM");
+  }, [send]);
 
   // ---- 上报切换 ----
   const handleReportToggle = useCallback(() => {
-    if (reportActive) {
-      send(COMMANDS.REPORT_STOP, "REPORT_STOP");
-    } else {
-      send(COMMANDS.REPORT_START, "REPORT_START");
-    }
-  }, [reportActive, send]);
+    send(COMMANDS.REPORT_TOGGLE, "REPORT_TOGGLE");
+  }, [send]);
 
   // ---- 断开后重连中界面 ----
   if (disconnected) {
@@ -468,6 +500,28 @@ export default function ControlPanel({
           </View>
         </View>
 
+        {/* 报警横幅 */}
+        {state.alarm === "ACTIVE" && (
+          <View style={styles.alarmBanner}>
+            <Text style={styles.alarmIcon}>⚠️</Text>
+            <View style={styles.alarmBody}>
+              <Text style={styles.alarmTitle}>缺水 / 水泵故障报警</Text>
+              <Text style={styles.alarmDetail}>
+                水泵已自动关闭，请检查水源或水泵。土壤变湿后会自动解除，或手动重置。
+              </Text>
+            </View>
+            <TouchableOpacity
+              style={styles.alarmResetBtn}
+              onPress={handleResetAlarm}
+              disabled={sending != null}
+            >
+              <Text style={styles.alarmResetText}>
+                {sending === "RESET_ALARM" ? "重置中..." : "重置报警"}
+              </Text>
+            </TouchableOpacity>
+          </View>
+        )}
+
         {/* ADC 值 */}
         {state.adc != null && (
           <Text style={styles.adcText}>ADC 原始值：{state.adc}</Text>
@@ -478,11 +532,11 @@ export default function ControlPanel({
           style={[
             styles.pumpBtn,
             state.pump === "ON" && styles.pumpBtnActive,
-            sending != null && styles.btnDisabled,
+            (sending != null || state.alarm === "ACTIVE") && styles.btnDisabled,
           ]}
           onPress={handleWateringToggle}
           activeOpacity={0.7}
-          disabled={sending != null}
+          disabled={sending != null || state.alarm === "ACTIVE"}
         >
           {sending === "PUMP_ON" || sending === "PUMP_OFF" ? (
             <ActivityIndicator color={Colors.white} size="large" />
@@ -493,28 +547,37 @@ export default function ControlPanel({
             {state.pump === "ON" ? "关闭水泵" : "手动浇水"}
           </Text>
           <Text style={styles.pumpBtnHint}>
-            {sending === "PUMP_ON" || sending === "PUMP_OFF"
-              ? "发送中..."
-              : state.pump === "ON"
-                ? "发送 PUMP_OFF"
-                : "发送 PUMP_ON"}
+            {state.alarm === "ACTIVE"
+              ? "报警中，已禁用"
+              : sending === "PUMP_ON" || sending === "PUMP_OFF"
+                ? "发送中..."
+                : state.pump === "ON"
+                  ? "发送 PUMP_OFF"
+                  : "发送 PUMP_ON"}
           </Text>
         </TouchableOpacity>
 
         {/* 模式切换 */}
         <View style={styles.actionSection}>
           <TouchableOpacity
-            style={[styles.actionRow, sending != null && styles.btnDisabled]}
+            style={[
+              styles.actionRow,
+              (sending != null || state.alarm === "ACTIVE") && styles.btnDisabled,
+            ]}
             onPress={() => send(COMMANDS.AUTO, "AUTO")}
             activeOpacity={0.6}
-            disabled={sending != null}
+            disabled={sending != null || state.alarm === "ACTIVE"}
           >
             <View style={styles.actionRowLeft}>
               <View style={[styles.actionDot, { backgroundColor: Colors.electric }]} />
               <View>
                 <Text style={styles.actionLabel}>切换到自动模式</Text>
                 <Text style={styles.actionHint}>
-                  {state.mode === "Auto" ? "当前已是自动模式" : "发送 AUTO 指令"}
+                  {state.alarm === "ACTIVE"
+                    ? "报警中，已禁用"
+                    : state.mode === "Auto"
+                      ? "当前已是自动模式"
+                      : "发送 AUTO 指令"}
                 </Text>
               </View>
             </View>
@@ -572,7 +635,7 @@ export default function ControlPanel({
                 <Text style={styles.actionHint}>每 2 秒自动获取最新状态</Text>
               </View>
             </View>
-            {sending === "REPORT_START" || sending === "REPORT_STOP" ? (
+            {sending === "REPORT_TOGGLE" ? (
               <ActivityIndicator color={Colors.electric} size="small" />
             ) : (
               <Text style={styles.actionArrow}>
@@ -782,6 +845,48 @@ const styles = StyleSheet.create({
     color: Colors.slate,
     marginTop: 16,
     fontFamily: "monospace",
+  },
+
+  // ========== 报警横幅 ==========
+  alarmBanner: {
+    flexDirection: "row",
+    alignItems: "center",
+    marginHorizontal: 20,
+    marginTop: 16,
+    padding: 14,
+    backgroundColor: "#FEF2F2",
+    borderRadius: Radius.lg,
+    borderWidth: 1,
+    borderColor: Colors.red,
+    gap: 12,
+  },
+  alarmIcon: {
+    fontSize: 24,
+  },
+  alarmBody: {
+    flex: 1,
+  },
+  alarmTitle: {
+    fontSize: 15,
+    fontWeight: "700",
+    color: Colors.red,
+  },
+  alarmDetail: {
+    fontSize: 12,
+    color: Colors.slate,
+    marginTop: 3,
+    lineHeight: 17,
+  },
+  alarmResetBtn: {
+    backgroundColor: Colors.red,
+    paddingHorizontal: 14,
+    paddingVertical: 9,
+    borderRadius: Radius.sm,
+  },
+  alarmResetText: {
+    color: Colors.white,
+    fontSize: 13,
+    fontWeight: "700",
   },
 
   // ========== 水泵按钮（Primary Action） ==========
